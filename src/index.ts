@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 type JsonRpcId = string | number | null;
@@ -38,6 +38,7 @@ type SyntheticContext = {
   clientId: JsonRpcId;
   legs: SyntheticLeg[];
   profile: string;
+  outputPath?: string;
   pendingCount: number;
   results: Array<SyntheticLegResult | null>;
 };
@@ -252,6 +253,7 @@ class MapboxMcpWrapper {
       return;
     }
     const profile = typeof args['profile'] === 'string' ? args['profile'] : 'mapbox/driving';
+    const outputPath = typeof args['output_path'] === 'string' ? args['output_path'] : undefined;
     const contextId = `synth-${++this.upstreamRequestCounter}`;
     const syntheticLegs: SyntheticLeg[] = legsRaw.map((leg: unknown) => {
       if (!isRecord(leg)) throw new Error('Invalid leg entry');
@@ -266,6 +268,7 @@ class MapboxMcpWrapper {
       clientId: message.id,
       legs: syntheticLegs,
       profile,
+      outputPath,
       pendingCount: syntheticLegs.length,
       results: new Array(syntheticLegs.length).fill(null) as Array<SyntheticLegResult | null>,
     };
@@ -359,6 +362,32 @@ class MapboxMcpWrapper {
       })
       .join('\n');
     const text = `Route GeoJSON built: ${context.legs.length} legs\n${legLines}\nTotal: ${totalKm}km, ${h}h${m}m`;
+
+    if (context.outputPath) {
+      try {
+        writeFileSync(context.outputPath, JSON.stringify(geojson), 'utf8');
+        log(`Synthetic build_route_geojson: GeoJSON written to ${context.outputPath}`);
+        this.clientTransport.send({
+          jsonrpc: '2.0',
+          id: context.clientId,
+          result: {
+            content: [{ type: 'text', text: `${text}\n\nGeoJSON written to: ${context.outputPath}` }],
+            structuredContent: {
+              file_path: context.outputPath,
+              legs: context.legs.length,
+              total_km: totalKm,
+              total_h: h,
+              total_m: m,
+            },
+          },
+        });
+        log(`Synthetic build_route_geojson finalized: ${context.legs.length} legs, ${totalKm}km, ${h}h${m}m → ${context.outputPath}`);
+        return;
+      } catch (err) {
+        log(`Failed to write ${context.outputPath}: ${String(err)} — falling back to inline response`);
+      }
+    }
+
     this.clientTransport.send({
       jsonrpc: '2.0',
       id: context.clientId,
@@ -556,6 +585,13 @@ const SYNTHETIC_TOOL_DEFINITIONS: unknown[] = [
           enum: ['mapbox/driving', 'mapbox/driving-traffic', 'mapbox/walking', 'mapbox/cycling'],
           default: 'mapbox/driving',
           description: 'Routing profile (default: mapbox/driving)',
+        },
+        output_path: {
+          type: 'string',
+          description:
+            'Optional absolute file path to write the GeoJSON to (e.g. "/Users/alice/route.geojson"). ' +
+            'When provided, the file is written directly by the server and the response is compact (summary + path). ' +
+            'When omitted, the full GeoJSON FeatureCollection is returned inline in structuredContent.',
         },
       },
       required: ['legs'],
