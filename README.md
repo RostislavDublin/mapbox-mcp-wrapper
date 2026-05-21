@@ -2,6 +2,35 @@
 
 `mapbox-mcp-wrapper` is a thin, upstream-friendly wrapper around `@mapbox/mcp-server`. Its purpose is to keep the upstream Mapbox MCP tool surface usable in agentic and headless workflows by enforcing non-interactive geocoding and search behavior while preserving upstream compatibility everywhere else.
 
+## Current Implementation
+
+This repository is not a fork of `@mapbox/mcp-server`. It is a separate wrapper package that is meant to be the only MCP server registered in the host. The wrapper starts the upstream Mapbox MCP server as an internal child process and proxies the upstream tool surface over stdio.
+
+The current implementation is intentionally narrow:
+
+- One visible MCP server: `mapbox-mcp-wrapper`
+- One upstream dependency: `@mapbox/mcp-server`
+- One targeted behavior change: remove `initialize.params.capabilities.elicitation` before forwarding the initialize request upstream
+- One fallback policy: if an upstream `elicitation/create` request still appears, immediately return `{ "action": "decline" }`
+
+That combination forces the upstream `search_and_geocode_tool` to use its existing non-interactive fallback path for ambiguous `2..10` result searches instead of surfacing host-rendered selection UI.
+
+## Runtime Model
+
+- The host should register only this wrapper, not both the wrapper and the upstream Mapbox server.
+- The wrapper launches the upstream Mapbox MCP process internally from the local dependency when available and falls back to `npx -y @mapbox/mcp-server` only if needed.
+- The wrapper preserves upstream tool names and schemas by proxying requests and responses instead of reimplementing individual tools.
+- The wrapper uses the current MCP SDK stdio transport format: newline-delimited JSON messages, not legacy `Content-Length` framing.
+
+## Validation Status
+
+The current implementation has been validated locally with the official MCP SDK client:
+
+- SDK `connect()` succeeds through the wrapper
+- SDK `listTools()` returns the upstream Mapbox tool surface through the wrapper
+- Ambiguous `search_and_geocode_tool` calls complete non-interactively through the wrapper
+- The wrapper can expose opt-in debug tracing with `MAPBOX_MCP_WRAPPER_DEBUG=1`
+
 ## Problem Statement
 
 The upstream Mapbox MCP geocoding and search flow may trigger MCP elicitation when a query returns 2 to 10 plausible matches. In interactive clients such as VS Code with Copilot, that elicitation can become host-rendered selection UI. That behavior is acceptable for human-in-the-loop use, but it is a bad fit for agentic flows, automation, and headless environments where tools must complete without asking the host to render an interactive chooser. This wrapper exists to remove that dependency on host UI and enforce deterministic, non-interactive behavior for the problematic path.

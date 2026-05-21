@@ -1,0 +1,23 @@
+{
+  "name": "mapbox-mcp-wrapper",
+  "version": "0.1.0",
+  "description": "Thin non-interactive wrapper around @mapbox/mcp-server.",
+  "license": "MIT",
+  "bin": {
+    "mapbox-mcp-wrapper": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@mapbox/mcp-server": "^0.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.3"
+  }
+}
