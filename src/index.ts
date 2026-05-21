@@ -20,6 +20,28 @@ type JsonRpcRequest = JsonRpcMessage & {
   method: string;
 };
 
+type SyntheticLeg = {
+  from: [number, number];
+  to: [number, number];
+  name: string;
+  via?: string;
+};
+
+type SyntheticLegResult = {
+  geometry: unknown;
+  distance_km: number;
+  duration_min: number;
+  via: string;
+};
+
+type SyntheticContext = {
+  clientId: JsonRpcId;
+  legs: SyntheticLeg[];
+  profile: string;
+  pendingCount: number;
+  results: Array<SyntheticLegResult | null>;
+};
+
 class FramedJsonRpcStream {
   private buffer = Buffer.alloc(0);
 
@@ -70,7 +92,10 @@ class MapboxMcpWrapper {
   private readonly clientRequestMap = new Map<string, JsonRpcId>();
   private readonly upstreamRequestMap = new Map<string, JsonRpcId>();
   private readonly pendingDirectionsRequests = new Set<string>();
-  private readonly pendingEnrichments = new Map<string, { originalClientId: JsonRpcId; response: JsonRpcMessage }>();
+  private readonly pendingEnrichments = new Map<string, { forwardedId: string; originalClientId: JsonRpcId; response: JsonRpcMessage }>();
+  private readonly pendingToolsListRequests = new Set<string>();
+  private readonly syntheticLegMap = new Map<string, { contextId: string; legIndex: number }>();
+  private readonly syntheticContexts = new Map<string, SyntheticContext>();
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly clientTransport: FramedJsonRpcStream;
   private readonly upstreamTransport: FramedJsonRpcStream;
@@ -98,10 +123,17 @@ class MapboxMcpWrapper {
     debug('client->wrapper', summarizeMessage(message));
 
     if (isRequest(message)) {
+      if (message.method === 'tools/call' && isRecord(message.params) && message.params.name === 'build_route_geojson') {
+        this.handleSyntheticBuildRouteGeojson(message);
+        return;
+      }
       const forwardedId = `client-${++this.upstreamRequestCounter}`;
       this.clientRequestMap.set(forwardedId, message.id);
       if (message.method === 'tools/call' && isRecord(message.params) && message.params.name === 'directions_tool') {
         this.pendingDirectionsRequests.add(forwardedId);
+      }
+      if (message.method === 'tools/list') {
+        this.pendingToolsListRequests.add(forwardedId);
       }
       debug('wrapper->upstream', `${summarizeMessage(message)} rewrittenId=${forwardedId}`);
       this.upstreamTransport.send({
@@ -163,7 +195,7 @@ class MapboxMcpWrapper {
         this.pendingEnrichments.delete(message.id);
         const enrichedResponse = applyGeometryEnrichment(enrichment.response, message);
         debug('wrapper->client', `Sending enriched directions response restoredId=${String(enrichment.originalClientId)}`);
-        this.clientTransport.send({ ...enrichedResponse, id: enrichment.originalClientId });
+        this.deliverResponseToClient(enrichment.forwardedId, enrichment.originalClientId, enrichedResponse);
         return;
       }
 
@@ -181,23 +213,161 @@ class MapboxMcpWrapper {
         const resourceUri = extractResourceUri(message);
         if (resourceUri) {
           const resourceReadId = `resource-read-${++this.upstreamRequestCounter}`;
-          this.pendingEnrichments.set(resourceReadId, { originalClientId: originalId, response: message });
+          this.pendingEnrichments.set(resourceReadId, { forwardedId: message.id, originalClientId: originalId, response: message });
           log(`Fetching geometry from temp resource: ${resourceUri}`);
           this.upstreamTransport.send({ jsonrpc: '2.0', method: 'resources/read', id: resourceReadId, params: { uri: resourceUri } });
           return;
         }
       }
 
+      if (this.pendingToolsListRequests.has(message.id)) {
+        this.pendingToolsListRequests.delete(message.id);
+        debug('wrapper->client', `tools/list: injecting synthetic tools, restoredId=${String(originalId)}`);
+        this.deliverResponseToClient(message.id, originalId, addSyntheticTools(message));
+        return;
+      }
+
       debug('wrapper->client', `${summarizeMessage(message)} restoredId=${String(originalId)}`);
-      this.clientTransport.send({
-        ...message,
-        id: originalId,
-      });
+      this.deliverResponseToClient(message.id, originalId, message);
       return;
     }
 
     debug('wrapper->client', summarizeMessage(message));
     this.clientTransport.send(message);
+  }
+
+  private handleSyntheticBuildRouteGeojson(message: JsonRpcRequest): void {
+    if (!isRecord(message.params)) {
+      this.clientTransport.send({ id: message.id, error: { code: -32602, message: 'Invalid params' } });
+      return;
+    }
+    const args = message.params['arguments'];
+    if (!isRecord(args)) {
+      this.clientTransport.send({ id: message.id, error: { code: -32602, message: 'arguments is required' } });
+      return;
+    }
+    const legsRaw = args['legs'];
+    if (!Array.isArray(legsRaw) || legsRaw.length === 0) {
+      this.clientTransport.send({ id: message.id, error: { code: -32602, message: 'legs must be a non-empty array' } });
+      return;
+    }
+    const profile = typeof args['profile'] === 'string' ? args['profile'] : 'mapbox/driving';
+    const contextId = `synth-${++this.upstreamRequestCounter}`;
+    const syntheticLegs: SyntheticLeg[] = legsRaw.map((leg: unknown) => {
+      if (!isRecord(leg)) throw new Error('Invalid leg entry');
+      return {
+        from: leg['from'] as [number, number],
+        to: leg['to'] as [number, number],
+        name: String(leg['name'] ?? ''),
+        via: typeof leg['via'] === 'string' ? leg['via'] : undefined,
+      };
+    });
+    const context: SyntheticContext = {
+      clientId: message.id,
+      legs: syntheticLegs,
+      profile,
+      pendingCount: syntheticLegs.length,
+      results: new Array(syntheticLegs.length).fill(null) as Array<SyntheticLegResult | null>,
+    };
+    this.syntheticContexts.set(contextId, context);
+    log(`Synthetic build_route_geojson: starting ${syntheticLegs.length} legs, profile=${profile}`);
+    syntheticLegs.forEach((leg, legIndex) => {
+      const forwardedId = `client-${++this.upstreamRequestCounter}`;
+      this.clientRequestMap.set(forwardedId, message.id);
+      this.pendingDirectionsRequests.add(forwardedId);
+      this.syntheticLegMap.set(forwardedId, { contextId, legIndex });
+      this.upstreamTransport.send({
+        jsonrpc: '2.0',
+        method: 'tools/call',
+        id: forwardedId,
+        params: {
+          name: 'directions_tool',
+          arguments: {
+            coordinates: [
+              { longitude: leg.from[0], latitude: leg.from[1] },
+              { longitude: leg.to[0], latitude: leg.to[1] },
+            ],
+            routing_profile: profile,
+            geometries: 'geojson',
+            alternatives: false,
+          },
+        },
+      });
+    });
+  }
+
+  private deliverResponseToClient(forwardedId: string, originalClientId: JsonRpcId, response: JsonRpcMessage): void {
+    if (this.syntheticLegMap.has(forwardedId)) {
+      const { contextId, legIndex } = this.syntheticLegMap.get(forwardedId)!;
+      this.syntheticLegMap.delete(forwardedId);
+      this.collectSyntheticLegResult(contextId, legIndex, response);
+      return;
+    }
+    this.clientTransport.send({ ...response, id: originalClientId });
+  }
+
+  private collectSyntheticLegResult(contextId: string, legIndex: number, response: JsonRpcMessage): void {
+    const context = this.syntheticContexts.get(contextId);
+    if (!context) {
+      log(`Synthetic context ${contextId} not found for leg ${legIndex}`);
+      return;
+    }
+    const sc = isRecord(response.result) ? response.result['structuredContent'] : null;
+    const routes = isRecord(sc) && Array.isArray(sc['routes']) ? sc['routes'] : [];
+    const route0 = routes[0];
+    const geometry = isRecord(route0) ? route0['geometry'] : null;
+    const distanceM = isRecord(route0) && typeof route0['distance'] === 'number' ? route0['distance'] : 0;
+    const durationS = isRecord(route0) && typeof route0['duration'] === 'number' ? route0['duration'] : 0;
+    const leg = context.legs[legIndex];
+    context.results[legIndex] = {
+      geometry: geometry ?? { type: 'LineString', coordinates: [] },
+      distance_km: Math.round(distanceM / 1000),
+      duration_min: Math.round(durationS / 60),
+      via: leg.via ?? '',
+    };
+    context.pendingCount--;
+    log(`Synthetic build_route_geojson: leg ${legIndex + 1}/${context.legs.length} done (${Math.round(distanceM / 1000)}km)`);
+    if (context.pendingCount === 0) {
+      this.finalizeSyntheticBuildRouteGeojson(contextId);
+    }
+  }
+
+  private finalizeSyntheticBuildRouteGeojson(contextId: string): void {
+    const context = this.syntheticContexts.get(contextId)!;
+    this.syntheticContexts.delete(contextId);
+    const features = context.legs.map((leg, i) => ({
+      type: 'Feature',
+      geometry: context.results[i]?.geometry ?? { type: 'LineString', coordinates: [] },
+      properties: {
+        leg: leg.name,
+        distance_km: context.results[i]?.distance_km ?? 0,
+        duration_min: context.results[i]?.duration_min ?? 0,
+        via: context.results[i]?.via ?? leg.via ?? '',
+      },
+    }));
+    const geojson = { type: 'FeatureCollection', features };
+    const totalKm = context.results.reduce((s, r) => s + (r?.distance_km ?? 0), 0);
+    const totalMin = context.results.reduce((s, r) => s + (r?.duration_min ?? 0), 0);
+    const h = Math.floor(totalMin / 60);
+    const m = totalMin % 60;
+    const legLines = context.legs
+      .map((leg, i) => {
+        const r = context.results[i];
+        const lh = Math.floor((r?.duration_min ?? 0) / 60);
+        const lm = (r?.duration_min ?? 0) % 60;
+        return `  ${leg.name}: ${r?.distance_km ?? '?'}km, ${lh}h${lm}m${leg.via ? ', via ' + leg.via : ''}`;
+      })
+      .join('\n');
+    const text = `Route GeoJSON built: ${context.legs.length} legs\n${legLines}\nTotal: ${totalKm}km, ${h}h${m}m`;
+    this.clientTransport.send({
+      jsonrpc: '2.0',
+      id: context.clientId,
+      result: {
+        content: [{ type: 'text', text }],
+        structuredContent: geojson,
+      },
+    });
+    log(`Synthetic build_route_geojson finalized: ${context.legs.length} legs, ${totalKm}km, ${h}h${m}m`);
   }
 }
 
@@ -355,6 +525,55 @@ function summarizeMessage(message: JsonRpcMessage): string {
   }
 
   return 'message';
+}
+
+const SYNTHETIC_TOOL_DEFINITIONS: unknown[] = [
+  {
+    name: 'build_route_geojson',
+    description:
+      'Build a GeoJSON FeatureCollection with real road geometry for a multi-leg route. ' +
+      'Calls directions_tool for each leg internally and assembles the result. ' +
+      'Use this instead of calling directions_tool repeatedly when you need a complete multi-leg route GeoJSON.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        legs: {
+          type: 'array',
+          description: 'Ordered list of route legs',
+          items: {
+            type: 'object',
+            properties: {
+              from: { type: 'array', items: { type: 'number' }, minItems: 2, maxItems: 2, description: '[longitude, latitude] of leg start' },
+              to: { type: 'array', items: { type: 'number' }, minItems: 2, maxItems: 2, description: '[longitude, latitude] of leg end' },
+              name: { type: 'string', description: 'Human-readable leg name, e.g. "Las Vegas to Springdale"' },
+              via: { type: 'string', description: 'Optional road/highway names to include in output properties' },
+            },
+            required: ['from', 'to', 'name'],
+          },
+        },
+        profile: {
+          type: 'string',
+          enum: ['mapbox/driving', 'mapbox/driving-traffic', 'mapbox/walking', 'mapbox/cycling'],
+          default: 'mapbox/driving',
+          description: 'Routing profile (default: mapbox/driving)',
+        },
+      },
+      required: ['legs'],
+    },
+  },
+];
+
+function addSyntheticTools(response: JsonRpcMessage): JsonRpcMessage {
+  if (!isRecord(response.result) || !Array.isArray(response.result['tools'])) {
+    return response;
+  }
+  return {
+    ...response,
+    result: {
+      ...response.result,
+      tools: [...(response.result['tools'] as unknown[]), ...SYNTHETIC_TOOL_DEFINITIONS],
+    },
+  };
 }
 
 new MapboxMcpWrapper();
