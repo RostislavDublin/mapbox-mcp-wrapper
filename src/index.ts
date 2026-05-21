@@ -69,6 +69,8 @@ class MapboxMcpWrapper {
   private clientRequestCounter = 0;
   private readonly clientRequestMap = new Map<string, JsonRpcId>();
   private readonly upstreamRequestMap = new Map<string, JsonRpcId>();
+  private readonly pendingDirectionsRequests = new Set<string>();
+  private readonly pendingEnrichments = new Map<string, { originalClientId: JsonRpcId; response: JsonRpcMessage }>();
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly clientTransport: FramedJsonRpcStream;
   private readonly upstreamTransport: FramedJsonRpcStream;
@@ -98,6 +100,9 @@ class MapboxMcpWrapper {
     if (isRequest(message)) {
       const forwardedId = `client-${++this.upstreamRequestCounter}`;
       this.clientRequestMap.set(forwardedId, message.id);
+      if (message.method === 'tools/call' && isRecord(message.params) && message.params.name === 'directions_tool') {
+        this.pendingDirectionsRequests.add(forwardedId);
+      }
       debug('wrapper->upstream', `${summarizeMessage(message)} rewrittenId=${forwardedId}`);
       this.upstreamTransport.send({
         ...rewriteInitializeForUpstream(message),
@@ -152,6 +157,16 @@ class MapboxMcpWrapper {
     }
 
     if (isResponse(message) && typeof message.id === 'string') {
+      // Enrichment responses (resource-read): not in clientRequestMap, handle first
+      if (this.pendingEnrichments.has(message.id)) {
+        const enrichment = this.pendingEnrichments.get(message.id)!;
+        this.pendingEnrichments.delete(message.id);
+        const enrichedResponse = applyGeometryEnrichment(enrichment.response, message);
+        debug('wrapper->client', `Sending enriched directions response restoredId=${String(enrichment.originalClientId)}`);
+        this.clientTransport.send({ ...enrichedResponse, id: enrichment.originalClientId });
+        return;
+      }
+
       const originalId = this.clientRequestMap.get(message.id);
       if (originalId === undefined) {
         log(`Ignoring unmatched upstream response id=${message.id}`);
@@ -159,6 +174,20 @@ class MapboxMcpWrapper {
       }
 
       this.clientRequestMap.delete(message.id);
+
+      // Directions enrichment: intercept large-response case, read resource, then forward
+      if (this.pendingDirectionsRequests.has(message.id)) {
+        this.pendingDirectionsRequests.delete(message.id);
+        const resourceUri = extractResourceUri(message);
+        if (resourceUri) {
+          const resourceReadId = `resource-read-${++this.upstreamRequestCounter}`;
+          this.pendingEnrichments.set(resourceReadId, { originalClientId: originalId, response: message });
+          log(`Fetching geometry from temp resource: ${resourceUri}`);
+          this.upstreamTransport.send({ jsonrpc: '2.0', method: 'resources/read', id: resourceReadId, params: { uri: resourceUri } });
+          return;
+        }
+      }
+
       debug('wrapper->client', `${summarizeMessage(message)} restoredId=${String(originalId)}`);
       this.clientTransport.send({
         ...message,
@@ -228,6 +257,88 @@ function debug(direction: string, message: string): void {
   }
 
   log(`${direction} ${message}`);
+}
+
+function extractResourceUri(response: JsonRpcMessage): string | null {
+  if (!isRecord(response.result)) return null;
+  const content = response.result['content'];
+  if (!Array.isArray(content)) return null;
+  for (const item of content) {
+    if (isRecord(item) && typeof item['text'] === 'string') {
+      const match = /Resource URI: (mapbox:\/\/temp\/directions-[a-f0-9]+)/.exec(item['text'] as string);
+      if (match) return match[1];
+    }
+  }
+  return null;
+}
+
+function applyGeometryEnrichment(
+  originalResponse: JsonRpcMessage,
+  resourceReadResponse: JsonRpcMessage,
+): JsonRpcMessage {
+  if (isRecord(resourceReadResponse.error)) {
+    log('resources/read returned an error; forwarding original directions response without geometry');
+    return originalResponse;
+  }
+
+  if (!isRecord(originalResponse.result) || !isRecord(resourceReadResponse.result)) {
+    return originalResponse;
+  }
+
+  const contents = resourceReadResponse.result['contents'];
+  if (!Array.isArray(contents) || contents.length === 0) return originalResponse;
+
+  const firstContent = contents[0];
+  if (!isRecord(firstContent) || typeof firstContent['text'] !== 'string') return originalResponse;
+
+  let fullData: unknown;
+  try {
+    fullData = JSON.parse(firstContent['text'] as string);
+  } catch {
+    log('Failed to parse resource content as JSON; forwarding original directions response');
+    return originalResponse;
+  }
+
+  if (!isRecord(fullData)) return originalResponse;
+
+  const routes = fullData['routes'];
+  if (!Array.isArray(routes) || routes.length === 0) return originalResponse;
+  const geometry = isRecord(routes[0]) ? routes[0]['geometry'] : undefined;
+  if (!geometry) {
+    log('No geometry in resource data; forwarding original directions response');
+    return originalResponse;
+  }
+
+  const result = originalResponse.result;
+  const structuredContent = result['structuredContent'];
+  if (!isRecord(structuredContent)) return originalResponse;
+
+  const scRoutes = structuredContent['routes'];
+  if (!Array.isArray(scRoutes) || scRoutes.length === 0) return originalResponse;
+
+  const patchedRoutes = scRoutes.map((route: unknown, i: number) =>
+    i === 0 && isRecord(route) ? { ...route, geometry } : route,
+  );
+
+  const patchedContent = Array.isArray(result['content'])
+    ? (result['content'] as unknown[]).map((item: unknown) => {
+        if (isRecord(item) && typeof item['text'] === 'string') {
+          return { ...item, text: (item['text'] as string).replace(/\n⚠️ Full response[\s\S]*$/, '') };
+        }
+        return item;
+      })
+    : result['content'];
+
+  log(`Geometry enrichment applied: ${(geometry as Record<string, unknown>)['type']} with ${((geometry as Record<string, unknown>)['coordinates'] as unknown[])?.length ?? '?'} coordinates`);
+
+  return {
+    ...originalResponse,
+    result: {
+      ...result,
+      content: patchedContent,
+      structuredContent: { ...structuredContent, routes: patchedRoutes },
+    },
+  };
 }
 
 function summarizeMessage(message: JsonRpcMessage): string {
